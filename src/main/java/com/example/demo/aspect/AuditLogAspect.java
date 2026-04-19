@@ -106,6 +106,7 @@ public class AuditLogAspect {
                 List<String> diffs = generateDiff(oldNode, newNode);
 
                 AuditMessage msg = AuditMessage.builder()
+                        .id(com.example.demo.util.SnowflakeIdWorker.getInstance().nextId())
                         .action(auditLog.action())
                         .resourceType(auditLog.resourceType())
                         .resourceId(resourceId)

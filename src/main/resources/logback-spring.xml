@@ -29,7 +29,7 @@
     <!-- Async Appender -->
     <appender name="ASYNC_AUDIT" class="ch.qos.logback.classic.AsyncAppender">
         <appender-ref ref="AUDIT_FILE" />
-        <queueSize>4096</queueSize>
+        <queueSize>2048</queueSize>
         <discardingThreshold>0</discardingThreshold>
     </appender>
 

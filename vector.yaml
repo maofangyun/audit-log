@@ -1,33 +1,74 @@
 sources:
   audit_logs:
     type: file
+    # 监听的日志文件路径，支持通配符和滚动切分
     include: ["/var/log/app/audit/*.log"]
+    # 发现新文件时从头部开始读取
     read_from: beginning
+    # 关键配置：指定 Vector 存储进度 (Checkpoints) 的本地目录，保证重启后不漏读、不重复读取
     data_dir: /var/lib/vector
+    # 解决超大包读取截断问题：默认单行最多 100KB，超出即截断。这里增大到 10MB
+    max_line_bytes: 10485760
 
 transforms:
   parse:
     type: remap
+    # 声明上游为上面的 audit_logs 数据源
     inputs: ["audit_logs"]
+    # 如果解析报错不立刻丢弃事件，辅助排查（比如非 JSON 日志）
+    drop_on_error: false
+    # 核心 VRL 处理逻辑脚本
     source: |
-      parsed = parse_json!(.message)
-      if is_string(parsed.message) {
-        inner, err = parse_json(parsed.message)
-        if err == null {
-          . = merge(parsed, inner)
-          del(.message)
-        } else {
-          . = parsed
-        }
+      # 1. 两次反序列化 (Logback 外部包了一层 JSON)
+      outer = parse_json!(.message)
+      inner = parse_json!(outer.message)
+      
+      # 2. 创建用于落库的新字典，键名与 DB 列名完美对应
+      new_event = {}
+      # 提取应用自带的分布式雪花 ID
+      new_event.id = inner.id
+      new_event.timestamp = outer."@timestamp"
+      new_event.action = inner.action
+      new_event.resource_type = inner.resourceType
+      new_event.resource_id = inner.resourceId
+      
+      # 3. 处理复杂的对象结构：如果存在且不为空，序列化为 String 以存入 Postgres 的 Text 字段
+      if exists(inner.oldState) && inner.oldState != null {
+          new_event.old_object = encode_json(inner.oldState)
       } else {
-        . = parsed
+          new_event.old_object = null
       }
+      
+      if exists(inner.newState) && inner.newState != null {
+          new_event.new_object = encode_json(inner.newState)
+      } else {
+          new_event.new_object = null
+      }
+      
+      # new_event.original_message = outer.message
+      
+      # 4. 替换原事件：将组装好的 new_event 赋值给当前事件
+      . = new_event
 
 sinks:
-  kafka_sink:
-    type: kafka
+  console_out:
+    # 控制台调试 Sink，排查问题时非常有用，可在 docker-compose logs 看到干净的解析后 JSON
+    type: console
     inputs: ["parse"]
-    bootstrap_servers: kafka:9092
-    topic: topic_audit_logs
     encoding:
       codec: json
+  pg_sink:
+    # 核心数据库 Sink，最终落库 Postgres
+    type: postgres
+    inputs: ["parse"]
+    endpoint: "postgresql://audit_user:audit_pass@postgres:5432/audit_db"
+    table: "audit_logs"
+    # 攒批写入 (Batching)，合并插入，极大提升高并发写入吞吐量
+    batch:
+      max_events: 100
+      timeout_secs: 5
+    # 磁盘容灾缓冲 (Disk Buffer)
+    buffer:
+      type: disk
+      max_size: 5368709120 # 最大允许在本地磁盘积压 5GB 的数据，防止 DB 宕机导致 Vector OOM
+      when_full: block     # 如果 5GB 也满了，就利用背压 (Backpressure) 暂停上游文件读取

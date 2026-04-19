@@ -1,0 +1,29 @@
+sources:
+  audit_logs:
+    type: file
+    include: ["/var/log/app/audit/*.log"]
+    read_from: beginning
+    data_dir: /var/lib/vector
+
+transforms:
+  parse:
+    type: remap
+    inputs: ["audit_logs"]
+    source: |
+      . = parse_json!(.message)
+      if is_string(.message) {
+        inner, err = parse_json(.message)
+        if err == null {
+          . = merge!(., inner)
+          del(.message)
+        }
+      }
+
+sinks:
+  kafka_sink:
+    type: kafka
+    inputs: ["parse"]
+    bootstrap_servers: kafka:9092
+    topic: topic_audit_logs
+    encoding:
+      codec: json

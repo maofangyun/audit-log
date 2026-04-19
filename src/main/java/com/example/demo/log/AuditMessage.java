@@ -6,6 +6,7 @@ import lombok.Data;
 @Data
 @Builder
 public class AuditMessage {
+    private Long id;
     private String action;
     private String resourceType;
     private String resourceId;

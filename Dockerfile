@@ -7,4 +7,4 @@ RUN mvn clean package -DskipTests
 FROM eclipse-temurin:17-jre-alpine
 VOLUME /tmp
 COPY --from=build /workspace/app/target/*SNAPSHOT.jar app.jar
-ENTRYPOINT ["java","-jar","/app.jar"]
+ENTRYPOINT ["sh", "-c", "java $JAVA_OPTS -jar /app.jar"]
