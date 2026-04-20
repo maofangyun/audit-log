@@ -1,0 +1,484 @@
+= 大数据量审计日志存储方案
+:revnumber: v1.0
+:revdate: 2025-01-01
+:toc: left
+:toclevels: 3
+:sectnums:
+:icons: font
+
+== 需求分析
+
+=== 当前方案现状
+
+当前系统采用 `sg-audit-starter` 审计日志组件，通过 AOP 切面注解方式和filter方式拦截请求并生成审计日志。
+日志的持久化流程如下：
+
+. 业务服务通过 `@AuditLog` 注解标记需要审计的方法
+. `sg-audit-starter` 的切面拦截请求，采集操作信息（操作类型、资源类型、资源ID、变更前后状态等）
+. **通过远程调用（WebClient）请求 platform 服务的保存接口**
+. platform 服务接收日志数据，写入 PG 数据库
+
+=== 当前方案痛点
+
+==== 痛点一：强耦合 — 业务服务与 platform 服务的同步依赖
+
+业务服务每次产生审计日志都需要同步调用 platform 服务的 HTTP 接口。当 platform 服务出现故障或响应缓慢时，
+会直接影响业务服务的接口性能，甚至导致业务请求超时失败。审计日志本应是"旁路逻辑"，不应影响主业务流程。
+
+==== 痛点二：性能瓶颈 — platform 服务成为系统单点
+
+所有微服务实例的审计日志都汇聚到单一的 platform 服务进行持久化。在高并发场景下：
+
+* platform 服务承受大量写入请求，CPU 和数据库连接池容易成为瓶颈
+* 单点写入 PG 数据库，数据库连接数和写入吞吐量受限
+* 随着日志量增长（10万-100万条/天），platform 服务的水平扩展能力有限
+
+==== 痛点三：可靠性不足 — 日志丢失风险
+
+* 远程调用受网络波动影响，调用失败则审计日志直接丢失
+* 虽然可以加入重试机制，但重试会增加请求延迟，且无法无限重试
+* platform 服务宕机期间产生的审计日志无法补录
+
+==== 痛点四：资源浪费 — 审计日志占用业务线程
+
+审计日志的序列化、网络传输、等待响应等操作都在业务线程中执行（即使异步发送也占用线程池资源），
+在高并发场景下占用大量业务线程，影响系统的整体吞吐量。
+
+=== 核心诉求
+
+综合以上痛点分析，核心诉求如下：
+
+[arabic]
+. **解耦**：审计日志的生成与持久化必须完全解耦，业务服务不应感知日志的存储方式，日志写入失败不能影响业务流程
+. **高性能**：日志采集过程对业务服务的性能影响降至最低，业务线程不参与日志的持久化操作
+. **高可靠**：日志数据不能因任何单点故障而丢失，需要具备缓冲和重试能力
+. **可扩展**：支持微服务实例同时产生日志，支持日志量持续增长
+
+== 改造目标
+
+=== 目标一：业务零影响
+
+审计日志的整个采集、传输、持久化链路对业务请求的性能影响接近于零。业务接口的响应时间不应因审计日志而产生可感知的增加。
+
+=== 目标二：数据零丢失
+
+在任何单点故障场景下（网络抖动、PG 数据库宕机等），审计日志数据不丢失。
+系统应具备缓冲和自动恢复能力。
+
+=== 目标三：架构可扩展
+
+系统支持微服务实例数量的横向扩展，支持日志量从当前 10-100万条/天 到未来更高量级的增长，
+无需对架构进行重大调整。
+
+== 方案详述
+
+=== 方案一：审计日志直接发送到 Kafka + PG 数据库
+
+==== 方案描述
+
+业务服务中的 `sg-audit-starter` 在采集到审计日志后，直接通过 Kafka Producer 将日志消息发送到 Kafka Topic。
+后端的 Consumer 服务（可以是 platform 服务或其他独立服务）消费 Kafka 中的消息，批量写入 PG 数据库。
+
+数据流：**业务服务 → Kafka → Consumer → PG**（3层）
+
+==== 序列图
+
+[plantuml]
+----
+@startuml
+autonumber
+hide footbox
+
+actor "用户" as User
+participant "业务服务\n(sg-audit-starter)" as Biz
+participant "Kafka" as Kafka
+participant "Consumer服务\n(platform)" as Consumer
+database "PG数据库" as PG
+
+User -> Biz: 发起业务请求
+activate Biz
+
+Biz -> Biz: AOP切面拦截\n生成审计日志
+
+note right of Biz: Kafka Producer\n(同步/异步发送)
+
+Biz -> Kafka: 发送审计日志消息
+activate Kafka
+Kafka --> Biz: 发送确认(ACK)
+deactivate Kafka
+
+Biz --> User: 返回业务响应
+deactivate Biz
+
+== 异步消费 ==
+
+loop 批量消费
+    Consumer -> Kafka: 拉取消息(batch)
+    activate Kafka
+    Kafka --> Consumer: 返回审计日志消息
+    deactivate Kafka
+    
+    Consumer -> Consumer: 解析\聚合消息
+    
+    Consumer -> PG: 批量INSERT
+    activate PG
+    PG --> Consumer: 写入成功
+    deactivate PG
+    
+    Consumer -> Kafka: 提交offset
+end
+
+@enduml
+----
+
+=== 方案二：审计日志保存到本地文件 + Vector + PG 数据库（本项目方案）
+
+==== 方案描述
+
+业务服务中的 `sg-audit-starter` 在采集到审计日志后，通过日志框架（Logback）将审计日志写入本地文件。
+使用独立的 Vector Agent（以 Docker Sidecar 模式与业务服务容器共同部署）监听日志文件的变化，
+Vector Agent 解析日志内容后直接写入 PG 数据库。
+
+本项目已实现了该方案的核心链路：
+
+* `AuditLogAspect` 切面采集审计日志，通过 `AUDIT_LOG_NAME` Logger 输出 JSON 格式日志
+* Logback 配置了 `AsyncAppender` + `RollingFileAppender`，异步写入本地文件 `/var/log/app/audit/audit.log`
+* Docker Compose 中通过 `shared_audit_logs` 卷共享日志文件目录给 Vector Agent
+* Vector Agent 读取共享卷中的日志文件，解析 JSON 后直接写入 PG 数据库（配置 PG sink）
+
+数据流：**业务服务 → 本地文件 → Vector → PG**（4层）
+
+==== 序列图
+
+[plantuml]
+----
+@startuml
+autonumber
+hide footbox
+
+actor "用户" as User
+participant "业务服务\n(sg-audit-starter)" as Biz
+database "本地文件\n(audit.log)" as File
+participant "Vector\nAgent" as Vector
+database "PG数据库" as PG
+
+User -> Biz: 发起业务请求
+activate Biz
+
+Biz -> Biz: AOP切面拦截\n生成审计日志
+
+note right of Biz: Logback 异步写入\n(AsyncAppender)
+
+Biz -> File: 写入审计日志(JSON)
+activate File
+File --> Biz: 写入完成(本地IO)
+deactivate File
+
+Biz --> User: 返回业务响应
+deactivate Biz
+
+== Vector 采集与入库 ==
+
+loop 持续监听
+    Vector -> File: 读取新增日志行
+    activate File
+    File --> Vector: 返回日志内容
+    deactivate File
+    
+    Vector -> Vector: 解析JSON\n转换格式
+    
+    Vector -> PG: 批量INSERT
+    activate PG
+    PG --> Vector: 写入成功
+    deactivate PG
+end
+
+@enduml
+----
+
+=== 方案三：审计日志保存到本地文件 + Vector + Kafka + PG 数据库
+
+==== 方案描述
+
+业务服务中的 `sg-audit-starter` 在采集到审计日志后，通过日志框架（Logback）将审计日志写入本地文件。
+使用独立的 Vector Agent 监听日志文件的变化，将日志内容解析后发送到 Kafka Topic。
+后端的 Consumer 服务消费 Kafka 消息，批量写入 PG 数据库。
+
+与方案二的区别在于 Vector 不直接写 PG，而是将消息发送到 Kafka，由独立的 Consumer 服务消费后写入 PG。
+引入 Kafka 作为中间缓冲层，在极高并发场景下可以更好地削峰填谷。
+
+数据流：**业务服务 → 本地文件 → Vector → Kafka → Consumer → PG**（5层）
+
+==== 序列图
+
+[plantuml]
+----
+@startuml
+autonumber
+hide footbox
+
+actor "用户" as User
+participant "业务服务\n(sg-audit-starter)" as Biz
+database "本地文件\n(audit.log)" as File
+participant "Vector\nAgent" as Vector
+participant "Kafka" as Kafka
+participant "Consumer服务\n(platform)" as Consumer
+database "PG数据库" as PG
+
+User -> Biz: 发起业务请求
+activate Biz
+
+Biz -> Biz: AOP切面拦截\n生成审计日志
+
+note right of Biz: Logback 异步写入\n(AsyncAppender)
+
+Biz -> File: 写入审计日志(JSON)
+activate File
+File --> Biz: 写入完成(本地IO)
+deactivate File
+
+Biz --> User: 返回业务响应
+deactivate Biz
+
+== Vector 采集 ==
+
+loop 持续监听
+    Vector -> File: 读取新增日志行
+    activate File
+    File --> Vector: 返回日志内容
+    deactivate File
+    
+    Vector -> Vector: 解析JSON\n转换格式
+    
+    Vector -> Kafka: 发送到Topic
+    activate Kafka
+    Kafka --> Vector: ACK
+    deactivate Kafka
+end
+
+== 异步消费 ==
+
+loop 批量消费
+    Consumer -> Kafka: 拉取消息(batch)
+    activate Kafka
+    Kafka --> Consumer: 返回审计日志消息
+    deactivate Kafka
+    
+    Consumer -> Consumer: 解析\聚合消息
+    
+    Consumer -> PG: 批量INSERT
+    activate PG
+    PG --> Consumer: 写入成功
+    deactivate PG
+    
+    Consumer -> Kafka: 提交offset
+end
+
+@enduml
+----
+
+== 方案对比
+
+=== 优势/劣势对比
+
+[cols="1,2,2,2"]
+|===
+| 对比维度 | 方案一（直发Kafka+PG） | 方案二（本地文件+Vector+PG） | 方案三（本地文件+Vector+Kafka+PG）
+
+|*优势1*| 架构简单，链路清晰 | 架构简洁，无Kafka依赖 | 完全解耦，Kafka削峰填谷
+|*优势2*| 实时性好，秒级以内入库 | 完全解耦，业务零网络依赖 | 完全解耦，业务零网络依赖
+|*优势3*| 无需额外基础设施（Vector） | 业务服务资源占用极低 | 业务服务资源占用极低
+|*优势4*| - | 组件少，运维简单 | Kafka 缓冲，高并发写入更稳定
+|*优势5*| - | 日志文件可回溯 | 日志文件可回溯
+
+|*劣势1*| Kafka客户端资源消耗大（20实例 ~640MB-1.3GB） | 无Kafka缓冲，高峰期PG直接承压 | 组件链路较长（5层）
+|*劣势2*| 业务进程耦合，Kafka不可用时可能阻塞 | Vector需维护PG连接池 | 需维护Kafka + Consumer服务
+|*劣势3*| 配置管理复杂，所有服务需统一Kafka配置 | 多个Vector实例同时写PG，连接数需规划 | 系统复杂度较高
+|*劣势4*| 依赖传递，所有服务需引入Kafka客户端依赖 | - | - 
+|*劣势5*| - | - | - 
+|===
+
+=== 改造工作量对比
+
+[cols="1,2,2,2"]
+|===
+| 改造项 | 方案一 | 方案二 | 方案三
+
+| `sg-audit-starter` 改造 | 将远程调用改为 Kafka Producer 发送；引入 Kafka 客户端依赖 | 确认 Logback 审计日志配置正确；去除远程调用 | 确认 Logback 审计日志配置正确；去除远程调用
+| 采集/传输层改造 | 无需额外组件 | 编写 Vector 配置文件（PG sink）；部署 Vector Agent（Docker Sidecar） | 编写 Vector 配置文件（Kafka sink）；部署 Vector Agent（Docker Sidecar）
+| Consumer 服务改造 | 新增 Kafka Consumer 监听；实现批量写入 PG | 不需要 Consumer | 新增 Kafka Consumer 监听；实现批量写入 PG
+| 全部微服务配置变更 | 所有服务需新增 Kafka 连接配置 | 无需变更 | 无需变更
+| 日志格式标准化 | 统一 Kafka 消息格式 | 统一日志 JSON 输出格式 | 统一日志 JSON 输出格式
+| 新增基础设施 | 无 | Vector Agent | Vector Agent + Kafka（已有则复用）
+| 测试验证 | 联调+性能+异常测试 | 联调+性能+异常测试 | 联调+性能+异常测试
+|===
+
+=== 资源占用对比
+
+==== 资源占用对比表
+
+===== 常规日志场景（单条日志 1-2KB）
+
+[cols="1,2,2,2"]
+|===
+| 资源维度 | 方案一 | 方案二 | 方案三
+
+|*业务服务CPU增量*| +2-5%/实例 | +<1%/实例 | +<1%/实例
+|*业务服务内存增量（单实例）*| +32-64MB/实例 | +10-20MB/实例 | +10-20MB/实例
+|*业务服务内存增量（20实例）*| +640MB~1.3GB | +200-400MB | +200-400MB
+|*Vector Agent（按节点部署）*| 不需要 | 单实例 ~1-3% CPU +
+~50-100MB 内存 | 单实例 ~1-3% CPU +
+~50-100MB 内存
+|*Kafka 集群*| 复用已有 | 不需要 | 复用已有
+|*Consumer 服务*| ~10-20% CPU +
+~512MB-1GB 内存 | 不需要 | ~10-20% CPU +
+~512MB-1GB 内存
+|*PG 数据库*| 写入CPU增加 ~5-10% | 写入CPU增加 ~5-15% +
+（多Vector直连，连接数增加） | 写入CPU增加 ~5-10% +
+（单Consumer批量写入）
+|*磁盘IO*| 无本地IO | 顺序写入，极低 | 顺序写入，极低
+|*总新增内存（不含已有组件）*| ~1.5-2.5GB | ~0.5-1GB | ~1-2GB
+|===
+
+===== 大对象日志场景（单条日志 ~100KB）
+
+[cols="1,2,2,2"]
+|===
+| 资源维度 | 方案一 | 方案二（queueSize=512） | 方案三（queueSize=512）
+
+|*业务服务CPU增量*| +3-8%/实例 +
+（大消息序列化+压缩开销） | +<1%/实例 | +<1%/实例
+|*业务服务内存增量（单实例）*| +137-281MB/实例 +
+（buffer.memory需调至128-256MB） | +60-75MB/实例 | +60-75MB/实例
+|*业务服务内存增量（20实例）*| +2.7-5.6GB | +1.2-1.5GB | +1.2-1.5GB
+|*Vector Agent（按节点部署）*| 不需要 | 单实例 ~1-3% CPU +
+~80-150MB 内存 +
+（解析大JSON开销增加） | 单实例 ~1-3% CPU +
+~80-150MB 内存
+|*Kafka 集群*| 复用已有，但磁盘占用增加 | 不需要 | 复用已有
+|*Consumer 服务*| ~10-20% CPU +
+~512MB-1GB 内存 | 不需要 | ~10-20% CPU +
+~512MB-1GB 内存
+|*PG 数据库*| 写入CPU增加 ~5-10% | 写入CPU增加 ~5-15% +
+（单条数据更大） | 写入CPU增加 ~5-10%
+|*磁盘IO*| 无本地IO | 顺序写入 +
+单文件增长更快 +
+需关注磁盘空间 | 顺序写入 +
+单文件增长更快
+|*总新增内存（不含已有组件）*| ~3.5-6.5GB | ~1.5-2GB | ~2-3GB
+|===
+
+NOTE: 大对象场景下，方案一受影响最大：Kafka Producer 的 `buffer.memory` 必须从默认 32MB 调大至 128-256MB，
+否则 32MB 仅能缓冲约 320 条 100KB 的消息，高峰期极易填满导致业务线程阻塞。
+方案二和方案三通过调小 Logback AsyncAppender 的 `queueSize`（如从 2048 调至 512）即可有效控制内存占用。
+
+==== 内存增量计算说明
+
+以下详细说明各方案中关键内存增量数据的计算依据。
+
+===== 方案一：业务服务内存增量
+
+方案一在每个业务服务实例中内嵌 Kafka Producer，主要内存消耗来源：
+
+[cols="1,3,2,2"]
+|===
+| 内存项 | 说明 | 估算值（常规日志） | 估算值（大对象日志）
+| Kafka Producer `buffer.memory` | Producer 内部消息缓冲区，用于暂存待发送的消息 | 默认 32MB | 需调大至 **128-256MB**
+| Producer 发送线程 | `sender` 线程及相关数据结构 | ~2-5MB | ~2-5MB
+| 序列化缓冲区 | 消息 key/value 序列化时的临时缓冲 | ~1-3MB | ~5-15MB
+| Metadata 缓存 | Kafka 集群元数据（Topic/Partition/Broker 信息） | ~2-5MB | ~2-5MB
+| **单实例合计（常规）** | 审计日志中不包含大型对象快照 | **~37-45MB** |
+| **单实例合计（大对象）** | 审计日志中包含大型对象的 oldState/newState | | **~137-281MB**
+|===
+
+NOTE: Kafka Producer 的 `buffer.memory` 默认为 32MB，表示 Producer 内部可以缓存的未发送消息总大小。
+当审计日志单条达到 100KB 时，32MB 仅能缓冲约 320 条消息，在高峰期极易填满导致阻塞。
+因此大对象场景下必须调大 `buffer.memory` 至 128-256MB，否则会频繁触发 `max.block.ms` 阻塞业务线程。
+
+
+===== 方案二：业务服务内存增量
+
+方案二在每个业务服务实例中仅使用 Logback AsyncAppender，无 Kafka 依赖，主要内存消耗来源：
+
+[cols="1,3,2,2"]
+|===
+| 内存项 | 说明 | 估算值（常规日志） | 估算值（大对象日志）
+| Logback AsyncAppender 队列 | 异步日志队列（当前配置 `queueSize=2048`） | 2048 × 2KB ≈ **4MB** | 2048 × 100KB ≈ **200MB**
+| 日志事件对象 | 队列中的 Logback LogEvent 对象开销 | ~2-5MB | ~5-10MB
+| JSON 序列化缓冲 | ObjectMapper 序列化时的临时缓冲 | ~1-3MB | ~5-10MB
+| RollingFileAppender | 文件输出流及缓冲区 | ~2-5MB | ~2-5MB
+| **单实例合计（常规）** | 审计日志中不包含大型对象快照 | **~9-17MB** |
+| **单实例合计（大对象）** | 审计日志中包含大型对象的 oldState/newState | | **~212-225MB**
+|===
+
+NOTE: 审计日志中包含 `oldState` 和 `newState`（完整的 JSON 对象快照），当被审计的资源对象较大时
+（如包含大量字段的配置对象、嵌套集合等），单条日志可能达到 100KB 甚至更大。
+此时 AsyncAppender 队列的内存占用将显著增加（`queueSize=2048` 时可达 200MB+）。
+
+===== 方案三：业务服务内存增量
+
+方案三的业务服务部分与方案二完全相同（均通过 Logback 写本地文件），因此单实例内存增量同样取决于日志大小：
+
+* 常规场景：**10-20MB/实例**
+* 大对象场景（`queueSize=512`）：**60-75MB/实例**
+
+但方案三需要额外的 Kafka 集群和 Consumer 服务：
+
+* Kafka 集群：复用已有，增量可忽略
+* Consumer 服务：~512MB-1GB
+
+=== 综合对比总览
+
+[cols="1,2,2,2"]
+|===
+| 对比维度 | 方案一（直发Kafka+PG） | 方案二（本地文件+Vector+PG） | 方案三（本地文件+Vector+Kafka+PG）
+|*架构复杂度*| 简单（3层） | 简洁（4层） | 较复杂（5层）
+|*业务解耦程度*| 中等（依赖Kafka可用性） | 高（仅依赖本地文件系统） | 高（仅依赖本地文件系统）
+|*对业务性能影响*| 低~中等 | 极低 | 极低
+|*实时性*| 高（秒级以内） | 较高（1-3秒延迟） | 较高（1-3秒延迟）
+|*数据可靠性*| 依赖Kafka | 依赖本地文件+Vector重试 | 依赖本地文件+Kafka双重保障
+|*业务服务资源占用*| 高 | 极低 | 极低
+|*总新增资源占用*| 中等 | 低 | 中等
+|*组件数量*| 业务服务 + Kafka + Consumer + PG | 业务服务 + Vector + PG | 业务服务 + Vector + Kafka + Consumer + PG
+|===
+
+== 总结与推荐
+
+=== 推荐方案：方案二（本地文件 + Vector + PG）
+
+=== 推荐理由
+
+==== 1. 核心诉求匹配度最高
+
+方案二完美匹配了前期分析的四项核心诉求：
+
+[arabic]
+. **解耦**：业务服务只写本地文件，完全不感知下游存储架构，不依赖任何外部服务（Kafka、platform），日志写入失败不影响业务流程
+. **高性能**：业务线程只做一次本地文件写入（通过 Logback AsyncAppender 异步化），对业务接口的响应时间影响在亚毫秒级别
+. **高可靠**：本地文件本身就是缓冲区，即使 PG 数据库短暂不可用，日志仍然写入本地文件不会丢失；Vector 恢复后从 checkpoint 继续采集和写入
+. **可扩展**：新增微服务实例只需挂载共享日志卷和部署 Vector Agent，无需修改任何配置
+
+==== 2. 架构最简洁
+
+* 仅 4 层链路（业务服务 → 本地文件 → Vector → PG），相比方案三减少了 Kafka 和 Consumer 两个环节
+* 组件数量最少（业务服务 + Vector + PG），运维和排错成本低
+* 不依赖 Kafka 集群的可用性，减少了外部依赖点
+
+==== 3. 资源利用率最优
+
+* **业务服务资源占用极低**：每个实例仅增加 10-20MB 内存和 <1% CPU（相比方案一）
+* **Vector Agent 轻量高效**：Vector 使用 Rust 编写，资源占用极低（50-100MB/实例），以 Docker Sidecar 模式与业务服务共同部署
+* **无需 Kafka 集群**：相比方案一和方案三，省去了 Kafka 的资源开销和维护成本
+* **无需独立 Consumer 服务**：Vector 直接写 PG，省去了 Consumer 服务的资源开销
+
+==== 4. 改造工作量最小
+
+* `sg-audit-starter` 的改动极小，核心日志采集逻辑保持不变，仅确保日志输出格式和 Logback 配置正确
+* 业务服务无需引入新的依赖（Kafka客户端），降低了依赖冲突和版本管理的风险
+* 不需要开发和维护独立的 Consumer 服务
+
+==== 5. 当前日志量级完全匹配
+
+当前日志量级为 10-100万条/天，Vector 直接批量写入 PG 数据库完全能够承载。
+Vector 内置了批量写入和重试机制，在当前量级下 PG 数据库不会成为瓶颈。
+方案三的 Kafka 缓冲层在当前量级下属于过度设计，增加了不必要的系统复杂度。
