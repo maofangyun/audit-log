@@ -1,37 +1,107 @@
+## =============================================================
+## Docker Compose — Claim Check 审计日志完整环境
+## 服务：postgres | minio | vector-agent | java-service
+## =============================================================
+
 volumes:
+  # Java 应用写入日志 → Vector 读取（共享）
   shared_audit_logs:
+  # Vector 磁盘缓冲（disk buffer）持久化
   vector_data:
-  postgres_data:
+  # PostgreSQL 数据持久化
+  pg_data:
+  # MinIO 对象存储持久化
+  minio_data:
 
 services:
+
+  # ──────────────────────────────────────────────────────────────
+  # 1. PostgreSQL 15（审计日志最终落库）
+  # ──────────────────────────────────────────────────────────────
   postgres:
     image: postgres:15-alpine
+    restart: unless-stopped
     environment:
-      - POSTGRES_USER=audit_user
-      - POSTGRES_PASSWORD=audit_pass
-      - POSTGRES_DB=audit_db
+      POSTGRES_USER: audit_user
+      POSTGRES_PASSWORD: audit_pass
+      POSTGRES_DB: audit_db
     ports:
       - "5432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+      - pg_data:/var/lib/postgresql/data
+      # 初始化脚本：创建 audit_logs 表及索引
+      - ./init-db.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U audit_user -d audit_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
-  java-service:
-    build: .
+  # ──────────────────────────────────────────────────────────────
+  # 2. MinIO（大对象 Claim Check 存储）
+  # ──────────────────────────────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
     environment:
-      - JAVA_OPTS=-Xmx2g -Xms1g
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
     ports:
-      - "8080:8080"
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web Console
     volumes:
-      - shared_audit_logs:/var/log/app/audit
-    depends_on:
-      - postgres
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
+  # ──────────────────────────────────────────────────────────────
+  # 3. Vector Agent（日志采集 → PostgreSQL）
+  # ──────────────────────────────────────────────────────────────
   vector-agent:
     image: timberio/vector:latest-alpine
+    restart: unless-stopped
     volumes:
+      # 只读挂载日志目录（Vector 只读取，Java 负责写入）
       - shared_audit_logs:/var/log/app/audit:ro
       - ./vector.yaml:/etc/vector/vector.yaml:ro
+      # Vector 磁盘缓冲持久化（防止重启后数据丢失）
       - vector_data:/var/lib/vector
+    command: ["--config", "/etc/vector/vector.yaml"]
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
+
+  # ──────────────────────────────────────────────────────────────
+  # 4. Java 应用（审计日志生产者）
+  # ──────────────────────────────────────────────────────────────
+  java-service:
+    build: .
+    restart: unless-stopped
+    # 恢复为默认桥接模式，Windows 不支持 host
+    environment:
+      JAVA_OPTS: "-Xmx4g -Xms4g -XX:+UseG1GC -XX:MaxGCPauseMillis=100"
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/audit_db
+      SPRING_DATASOURCE_USERNAME: audit_user
+      SPRING_DATASOURCE_PASSWORD: audit_pass
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET: audit-payloads
+    ports:
+      - "8080:8080"
+    deploy:
+      resources:
+        limits:
+          memory: 5G
+    volumes:
+      # 将应用日志目录映射到共享卷，Vector 从此卷读取
+      - shared_audit_logs:/var/log/app/audit
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy

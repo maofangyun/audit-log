@@ -1,65 +1,92 @@
 const http = require('http');
 
 const TARGET_URL = 'http://localhost:8080/test/user/update';
-const CONCURRENCY = 10; // 并发数（注意：1MB大包，并发不宜开启过高，否则会瞬间挤爆带宽）
-const TEST_DURATION_MS = 30000; // 测试持续 30 秒
+const CONCURRENCY = 20; 
+const TEST_DURATION_MS = 60000; // 测试持续 60 秒
 
-// 生成约 1.1MB 的随机大字符串
-const bigData = 'X'.repeat(1024);
+/**
+ * 生成约 targetSizeMB 的真实 JSON 格式字符串
+ */
+function generateLargeJsonString(targetSizeMB) {
+    const targetSizeBytes = targetSizeMB * 1024 * 1024;
+    const itemTemplate = {
+        id: 10001,
+        guid: "d9e8c7b6-a5b4-c3d2-e1f0-9a8b7c6d5e4f",
+        isActive: true,
+        balance: "$3,141.59",
+        name: "Performance Test User",
+        company: "AUDIT-LOG-SERVICES",
+        about: "This is a long description used to fill space and simulate a real-world JSON object with significant text content.",
+        registered: "2026-04-24T10:00:00.000Z",
+        tags: ["audit", "log", "performance", "test"],
+        metadata: { appVersion: "1.2.3", environment: "production" }
+    };
+    
+    const singleItemStr = JSON.stringify(itemTemplate);
+    const count = Math.ceil(targetSizeBytes / (singleItemStr.length + 1));
+    const items = [];
+    for (let i = 0; i < count; i++) {
+        items.push({ ...itemTemplate, id: i });
+    }
+    return JSON.stringify(items);
+}
 
-const payload = JSON.stringify({
-    id: "perf-test-id",
-    name: bigData, // 填充超大内容
-    age: 25
-});
+console.log("🚀 准备测试数据...");
+const bigData = generateLargeJsonString(10);
+const payload = JSON.stringify({ id: "perf-test-id", name: bigData, age: 25 });
+const payloadBuffer = Buffer.from(payload);
+const actualSizeMB = payloadBuffer.length / (1024 * 1024);
 
 const options = {
     method: 'POST',
     headers: {
         'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(payload)
+        'Content-Length': payloadBuffer.length
     }
 };
 
 let successCount = 0;
 let errorCount = 0;
+let activeRequests = 0; // 当前正在进行的请求数
+let isStopping = false; // 是否已到达测试时长，准备停止
 const startTime = Date.now();
 
 /**
  * 发送压测请求的核心方法
- * 该方法采用异步递归模式，以维持恒定的并发压力
  */
 function sendRequest() {
-    // 【同步】检查测试时长，超时则停止递归调用
-    if (Date.now() - startTime > TEST_DURATION_MS) return;
+    // 如果已经超时且没有正在进行的请求，则彻底结束
+    if (Date.now() - startTime > TEST_DURATION_MS) {
+        isStopping = true;
+        return;
+    }
 
-    // 【异步/非阻塞】发起请求，该方法会立即返回一个请求对象 req
-    // 此处的 (res) => { ... } 回调函数是异步的，在收到响应头后由事件循环触发
+    activeRequests++;
     const req = http.request(TARGET_URL, options, (res) => {
-        // 【异步监听】每当接收到一小块响应数据时触发，必须监听以确保响应流流动
         res.on('data', () => { });
-
-        // 【异步监听】当整个 HTTP 响应接收完成时触发
         res.on('end', () => {
-            successCount++; // 【同步】成功计数
-            sendRequest();  // 【异步递归】发起下一个请求，保持并发数
+            if (res.statusCode === 200) successCount++;
+            else errorCount++;
+            
+            activeRequests--;
+            sendRequest(); // 递归发起下一个
         });
     });
 
-    // 【异步监听】当网络连接、DNS 或数据传输发生错误时触发
     req.on('error', (e) => {
-        errorCount++;   // 【同步】错误计数
-        sendRequest();  // 【异步递归】出错后也继续尝试，保持并发压力
+        errorCount++;
+        activeRequests--;
+        sendRequest();
     });
 
-    // 【半异步】将 1MB 负载写入内核缓冲区，系统会择机通过网卡发出
-    req.write(payload);
-
-    // 【异步触发】标记请求发送完成
+    req.write(payloadBuffer);
     req.end();
 }
 
-console.log(`🚀 开始压力测试... 负载大小: ~1.1MB, 并发数: ${CONCURRENCY}`);
+console.log(`🔥 开始压力测试...`);
+console.log(`📊 负载大小: ${actualSizeMB.toFixed(2)} MB | 并发: ${CONCURRENCY} | 时长: ${TEST_DURATION_MS/1000}s`);
+console.log('--------------------------------------------');
+
 for (let i = 0; i < CONCURRENCY; i++) {
     sendRequest();
 }
@@ -67,12 +94,22 @@ for (let i = 0; i < CONCURRENCY; i++) {
 // 每秒打印一次进度
 const timer = setInterval(() => {
     const elapsed = (Date.now() - startTime) / 1000;
-    console.log(`⏱ 已耗时: ${elapsed.toFixed(1)}s | 成功: ${successCount} | 失败: ${errorCount} | 吞吐量: ${(successCount * 1.1 / elapsed).toFixed(2)} MB/s`);
-
-    if (elapsed >= TEST_DURATION_MS / 1000) {
-        clearInterval(timer);
-        console.log('\n✅ 测试结束!');
-        console.log(`总计成功: ${successCount}`);
-        console.log(`平均吞吐量: ${(successCount * 1.1 / (TEST_DURATION_MS / 1000)).toFixed(2)} MB/s`);
+    const throughput = (successCount * actualSizeMB / elapsed).toFixed(2);
+    
+    if (!isStopping) {
+        process.stdout.write(`⏱ 运行中: ${elapsed.toFixed(1)}s | 成功: ${successCount} | 失败: ${errorCount} | 吞吐量: ${throughput} MB/s\r`);
+    } else {
+        process.stdout.write(`⏳ 正在收尾 (等待 ${activeRequests} 个在途请求)... 成功: ${successCount}\r`);
     }
-}, 1000);
+
+    // 只有当时间到了且所有在途请求都已返回，才停止定时器并退出
+    if (isStopping && activeRequests === 0) {
+        clearInterval(timer);
+        const finalElapsed = (Date.now() - startTime) / 1000;
+        console.log('\n\n✅ 测试结束!');
+        console.log(`总计成功: ${successCount}`);
+        console.log(`总计失败: ${errorCount}`);
+        console.log(`实际总时长: ${finalElapsed.toFixed(2)}s`);
+        console.log(`平均吞吐量: ${(successCount * actualSizeMB / finalElapsed).toFixed(2)} MB/s`);
+    }
+}, 500);

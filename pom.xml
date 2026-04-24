@@ -2,58 +2,90 @@
 <project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
 	xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
 	<modelVersion>4.0.0</modelVersion>
+
 	<parent>
 		<groupId>org.springframework.boot</groupId>
 		<artifactId>spring-boot-starter-parent</artifactId>
 		<version>4.0.5</version>
-		<relativePath/> <!-- lookup parent from repository -->
+		<relativePath/>
 	</parent>
+
 	<groupId>com.example</groupId>
-	<artifactId>demo</artifactId>
+	<artifactId>audit-log</artifactId>
 	<version>0.0.1-SNAPSHOT</version>
-	<name/>
-	<description/>
-	<url/>
-	<licenses>
-		<license/>
-	</licenses>
-	<developers>
-		<developer/>
-	</developers>
-	<scm>
-		<connection/>
-		<developerConnection/>
-		<tag/>
-		<url/>
-	</scm>
+	<name>audit-log</name>
+	<description>基于 Claim Check 模式的异步审计日志服务</description>
+
 	<properties>
 		<java.version>17</java.version>
 	</properties>
+
 	<dependencies>
+		<!-- Spring Web MVC -->
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-starter-webmvc</artifactId>
 		</dependency>
 
+		<!-- Spring AOP -->
 		<dependency>
 			<groupId>org.aspectj</groupId>
 			<artifactId>aspectjweaver</artifactId>
 			<version>1.9.21</version>
 		</dependency>
+
+		<!-- Logstash Logback Encoder：结构化 JSON 日志 -->
 		<dependency>
 			<groupId>net.logstash.logback</groupId>
 			<artifactId>logstash-logback-encoder</artifactId>
 			<version>7.4</version>
 		</dependency>
 
+		<!-- Lombok -->
 		<dependency>
 			<groupId>org.projectlombok</groupId>
 			<artifactId>lombok</artifactId>
 			<optional>true</optional>
 		</dependency>
+
+		<!-- Kryo：高性能二进制序列化，用于大对象 Claim Check -->
+		<dependency>
+			<groupId>com.esotericsoftware</groupId>
+			<artifactId>kryo</artifactId>
+			<version>5.6.2</version>
+		</dependency>
+
+		<!-- MinIO SDK：将大对象上传至对象存储 -->
+		<dependency>
+			<groupId>io.minio</groupId>
+			<artifactId>minio</artifactId>
+			<version>8.5.11</version>
+		</dependency>
+
+		<!-- Spring JDBC -->
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
-			<artifactId>spring-boot-starter-webmvc-test</artifactId>
+			<artifactId>spring-boot-starter-jdbc</artifactId>
+		</dependency>
+
+		<!-- PostgreSQL JDBC 驱动 -->
+		<dependency>
+			<groupId>org.postgresql</groupId>
+			<artifactId>postgresql</artifactId>
+			<scope>runtime</scope>
+		</dependency>
+
+		<!-- H2 内存数据库（仅测试使用） -->
+		<dependency>
+			<groupId>com.h2database</groupId>
+			<artifactId>h2</artifactId>
+			<scope>test</scope>
+		</dependency>
+
+		<!-- 测试框架 -->
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-test</artifactId>
 			<scope>test</scope>
 		</dependency>
 	</dependencies>

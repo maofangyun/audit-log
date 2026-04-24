@@ -11,9 +11,9 @@
 
     <!-- Audit Rolling File Appender -->
     <appender name="AUDIT_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
-        <file>/var/log/app/${APP_NAME}/audit.log</file>
+        <file>/var/log/app/audit/audit.log</file>
         <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
-            <fileNamePattern>/var/log/app/${APP_NAME}/audit-%d{yyyy-MM-dd}.%i.log</fileNamePattern>
+            <fileNamePattern>/var/log/app/audit/audit-%d{yyyy-MM-dd}.%i.log</fileNamePattern>
             <maxFileSize>200MB</maxFileSize>
             <maxHistory>7</maxHistory>
         </rollingPolicy>

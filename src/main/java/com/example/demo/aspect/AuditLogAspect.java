@@ -3,7 +3,9 @@ package com.example.demo.aspect;
 import com.example.demo.log.AuditContextHolder;
 import com.example.demo.log.AuditLog;
 import com.example.demo.log.AuditMessage;
-import com.fasterxml.jackson.databind.JsonNode;
+import com.example.demo.service.ClaimCheckService;
+import com.example.demo.util.SnowflakeIdWorker;
+import com.example.demo.util.SpElUtils;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.aspectj.lang.ProceedingJoinPoint;
 import org.aspectj.lang.annotation.Around;
@@ -11,165 +13,166 @@ import org.aspectj.lang.annotation.Aspect;
 import org.aspectj.lang.reflect.MethodSignature;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.core.StandardReflectionParameterNameDiscoverer;
-import org.springframework.expression.EvaluationContext;
-import org.springframework.expression.ExpressionParser;
-import org.springframework.expression.spel.standard.SpelExpressionParser;
 import org.springframework.expression.spel.support.StandardEvaluationContext;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 
 import java.lang.reflect.Method;
-import java.util.ArrayList;
-import java.util.Iterator;
-import java.util.List;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.Executor;
 
+/**
+ * 审计日志切面 —— Claim Check 模式集成版
+ *
+ * <p>处理流程：
+ * <ol>
+ *   <li>AOP 拦截 {@link AuditLog} 注解方法</li>
+ *   <li>同步执行目标方法</li>
+ *   <li>提交异步任务至 auditAsyncPool</li>
+ *   <li>异步任务内：Claim Check 决策 → 构造 {@link AuditMessage} → 落盘</li>
+ * </ol>
+ *
+ * <p>SpEL 解析委托 {@link SpElUtils}，ID 生成委托 {@link SnowflakeIdWorker}。
+ */
 @Aspect
 @Component
 public class AuditLogAspect {
 
-    private static final Logger auditLogger = LoggerFactory.getLogger("AUDIT_LOG_NAME");
-    private final ExpressionParser parser = new SpelExpressionParser();
-    private final StandardReflectionParameterNameDiscoverer discoverer = new StandardReflectionParameterNameDiscoverer();
-    private final ObjectMapper objectMapper = new ObjectMapper();
+    private static final Logger AUDIT_LOGGER = LoggerFactory.getLogger("AUDIT_LOG_NAME");
+
+    private final StandardReflectionParameterNameDiscoverer paramNameDiscoverer =
+            new StandardReflectionParameterNameDiscoverer();
+
+    private final ObjectMapper objectMapper;
+    private final ClaimCheckService claimCheckService;
+    private final Executor auditAsyncPool;
+    private final SnowflakeIdWorker snowflakeIdWorker;
+
+    public AuditLogAspect(ClaimCheckService claimCheckService,
+                          @Qualifier("auditAsyncPool") Executor auditAsyncPool,
+                          ObjectMapper objectMapper,
+                          SnowflakeIdWorker snowflakeIdWorker) {
+        this.claimCheckService = claimCheckService;
+        this.auditAsyncPool = auditAsyncPool;
+        this.objectMapper = objectMapper;
+        this.snowflakeIdWorker = snowflakeIdWorker;
+    }
 
     @Around("@annotation(auditLog)")
     public Object around(ProceedingJoinPoint joinPoint, AuditLog auditLog) throws Throwable {
-        String resourceId = "";
-        JsonNode oldNode = null;
-        JsonNode newNode = null;
+        // 1. 生成 traceId（若 MDC 已有则复用）
+        String traceId = MDC.get("traceId");
+        if (!StringUtils.hasText(traceId)) {
+            traceId = UUID.randomUUID().toString().replace("-", "");
+        }
+        String userId = MDC.get("userId");
 
+        // 2. 构建 SpEL 上下文
         MethodSignature signature = (MethodSignature) joinPoint.getSignature();
         Method method = signature.getMethod();
         Object[] args = joinPoint.getArgs();
-        String[] params = discoverer.getParameterNames(method);
-        StandardEvaluationContext context = new StandardEvaluationContext();
+        String[] paramNames = paramNameDiscoverer.getParameterNames(method);
+        StandardEvaluationContext spelContext = SpElUtils.buildContext(paramNames, args);
 
-        if (params != null) {
-            for (int i = 0; i < params.length; i++) {
-                context.setVariable(params[i], args[i]);
-            }
+        // 3. 解析注解属性
+        String resourceId = SpElUtils.evalString(auditLog.resourceIdSpEL(), spelContext, "PARSE_ERROR");
+
+        // userId：优先 MDC，其次注解 SpEL
+        if (!StringUtils.hasText(userId)) {
+            userId = SpElUtils.evalString(auditLog.userIdSpEL(), spelContext, null);
         }
 
-        // 1. Evaluate Resource ID
-        try {
-            if (StringUtils.hasText(auditLog.resourceIdSpEL())) {
-                Object val = parser.parseExpression(auditLog.resourceIdSpEL()).getValue(context);
-                if (val != null) {
-                    resourceId = String.valueOf(val);
-                }
-            }
-        } catch (Exception e) {
-            resourceId = "PARSE_ERROR";
+        // oldObject：优先注解 SpEL，其次 AuditContextHolder
+        Object oldObject = SpElUtils.eval(auditLog.oldObjectSpEL(), spelContext);
+        if (oldObject == null) {
+            oldObject = AuditContextHolder.getOldObject();
         }
 
-        // 2. Evaluate Old Object before execution (freezing state)
-        try {
-            if (StringUtils.hasText(auditLog.oldObjectSpEL())) {
-                Object val = parser.parseExpression(auditLog.oldObjectSpEL()).getValue(context);
-                if (val != null) {
-                    oldNode = objectMapper.valueToTree(val);
-                }
-            }
-        } catch (Exception ignored) {
-        }
-        
-        // Fallback: If oldNode is null, try to retrieve from AuditContextHolder
-        if (oldNode == null) {
-            oldNode = AuditContextHolder.getOldObject();
-        }
-
+        // 4. 执行目标方法
         String status = "SUCCESS";
-        String details = "";
+        String errorMsg = null;
         Object result = null;
-
         try {
-            // Execute method
             result = joinPoint.proceed();
             return result;
         } catch (Throwable t) {
             status = "FAIL";
-            details = t.getMessage();
+            errorMsg = t.getMessage();
             throw t;
         } finally {
-            try {
-                // Now evaluate new object
-                context.setVariable("result", result);
-                if (StringUtils.hasText(auditLog.newObjectSpEL())) {
-                    Object val = parser.parseExpression(auditLog.newObjectSpEL()).getValue(context);
-                    if (val != null) {
-                        newNode = objectMapper.valueToTree(val);
-                    }
-                }
-                
-                // Compare differences
-                List<String> diffs = generateDiff(oldNode, newNode);
+            // 5. 异步提交审计任务
+            final String finalTraceId    = traceId;
+            final String finalUserId     = userId;
+            final String finalResourceId = resourceId;
+            final String finalStatus     = status;
+            final String finalErrorMsg   = errorMsg;
+            final Object finalOldObject  = oldObject;
+            final Object finalResult     = result;
 
-                AuditMessage msg = AuditMessage.builder()
-                        .id(com.example.demo.util.SnowflakeIdWorker.getInstance().nextId())
-                        .action(auditLog.action())
-                        .resourceType(auditLog.resourceType())
-                        .resourceId(resourceId)
-                        .status(status)
-                        .details(details)
-                        .oldState(oldNode)
-                        .newState(newNode)
-                        .diffs(diffs)
-                        .build();
-
-                auditLogger.info(objectMapper.writeValueAsString(msg));
-            } catch (Exception ignored) {
-            } finally {
-                AuditContextHolder.clear();
-            }
+            auditAsyncPool.execute(() ->
+                processAuditAsync(
+                    auditLog, spelContext,
+                    finalTraceId, finalUserId, finalResourceId,
+                    finalStatus, finalErrorMsg,
+                    finalOldObject, finalResult
+                )
+            );
+            AuditContextHolder.clear();
         }
     }
 
-    private List<String> generateDiff(JsonNode oldNode, JsonNode newNode) {
-        List<String> diffs = new ArrayList<>();
-        if (oldNode == null && newNode == null) {
-            return diffs;
-        }
-        if (oldNode == null) {
-            diffs.add("Created new object");
-            return diffs;
-        }
-        if (newNode == null) {
-            diffs.add("Deleted object");
-            return diffs;
-        }
+    /**
+     * 异步审计处理核心：Claim Check 决策 + 构造消息 + 落盘
+     */
+    private void processAuditAsync(AuditLog auditLog,
+                                   StandardEvaluationContext spelContext,
+                                   String traceId, String userId, String resourceId,
+                                   String status, String errorMsg,
+                                   Object oldObject, Object methodResult) {
+        try {
+            // 解析 newObject（方法执行后快照，可通过 #result 引用返回值）
+            SpElUtils.setVariable(spelContext, "result", methodResult);
+            Object newObject = SpElUtils.eval(auditLog.newObjectSpEL(), spelContext);
 
-        if (oldNode.isObject() && newNode.isObject()) {
-            Iterator<String> newFields = newNode.fieldNames();
-            while (newFields.hasNext()) {
-                String field = newFields.next();
-                JsonNode oldVal = oldNode.get(field);
-                JsonNode newVal = newNode.get(field);
-
-                if (oldVal == null || oldVal.isNull()) {
-                    if (newVal != null && !newVal.isNull()) {
-                        diffs.add(field + ": null -> " + newVal.asText());
-                    }
-                } else if (!oldVal.equals(newVal)) {
-                    diffs.add(field + ": " + oldVal.asText() + " -> " + newVal.asText());
-                }
+            // Claim Check 决策
+            Object detailsPayload;
+            boolean isLargePayload;
+            Map<String, Object> pointer = claimCheckService.processDetailsPayload(traceId, oldObject, newObject);
+            if (pointer != null) {
+                isLargePayload = true;
+                detailsPayload = pointer;
+            } else {
+                isLargePayload = false;
+                Map<String, Object> inline = new HashMap<>();
+                if (oldObject != null) inline.put("before", oldObject);
+                if (newObject != null) inline.put("after",  newObject);
+                if (StringUtils.hasText(errorMsg)) inline.put("error", errorMsg);
+                detailsPayload = inline.isEmpty() ? null : inline;
             }
 
-            // Check for fields that were deleted
-            Iterator<String> oldFields = oldNode.fieldNames();
-            while (oldFields.hasNext()) {
-                String field = oldFields.next();
-                if (!newNode.has(field) || newNode.get(field).isNull()) {
-                    JsonNode oldVal = oldNode.get(field);
-                    if (oldVal != null && !oldVal.isNull()) {
-                        diffs.add(field + ": " + oldVal.asText() + " -> null");
-                    }
-                }
-            }
-        } else if (!oldNode.equals(newNode)) {
-            diffs.add("value: " + oldNode.asText() + " -> " + newNode.asText());
-        }
+            // 构造 AuditMessage 并落盘
+            AuditMessage msg = AuditMessage.builder()
+                    .id(snowflakeIdWorker.nextId())
+                    .traceId(traceId)
+                    .userId(userId)
+                    .action(auditLog.action())
+                    .resourceType(auditLog.resourceType())
+                    .resourceId(resourceId)
+                    .businessId(resourceId)
+                    .status(status)
+                    .isLargePayload(isLargePayload)
+                    .details(detailsPayload)
+                    .build();
 
-        return diffs;
+            AUDIT_LOGGER.info(objectMapper.writeValueAsString(msg));
+
+        } catch (Exception e) {
+            AUDIT_LOGGER.error("[AuditLogAspect] 审计任务处理异常: {}", e.getMessage(), e);
+        }
     }
 }

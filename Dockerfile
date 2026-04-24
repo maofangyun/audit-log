@@ -1,10 +1,5 @@
-FROM maven:3.9.6-eclipse-temurin-17-alpine AS build
-WORKDIR /workspace/app
-COPY pom.xml .
-COPY src src
-RUN mvn clean package -DskipTests
-
 FROM eclipse-temurin:17-jre-alpine
 VOLUME /tmp
-COPY --from=build /workspace/app/target/*SNAPSHOT.jar app.jar
+# 使用本地构建好的 JAR 文件，避免 Docker 内部下载 Maven 依赖失败
+COPY target/*SNAPSHOT.jar app.jar
 ENTRYPOINT ["sh", "-c", "java $JAVA_OPTS -jar /app.jar"]

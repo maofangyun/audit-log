@@ -135,18 +135,23 @@ end
 
 ==== 方案描述
 
-业务服务中的 `sg-audit-starter` 在采集到审计日志后，通过日志框架（Logback）将审计日志写入本地文件。
-使用独立的 Vector Agent（以 Docker Sidecar 模式与业务服务容器共同部署）监听日志文件的变化，
-Vector Agent 解析日志内容后直接写入 PG 数据库。
+业务服务在采集审计日志时，引入 **Claim Check (大对象卸载)** 模式。超大报文（>=100KB）被异步卸载至 MinIO，本地日志仅记录包含指针的轻量化 JSON。Sidecar 部署的 Vector Agent 负责提取业务元数据并实现物理列入库。
 
-本项目已实现了该方案的核心链路：
+本项目已实现了该方案的完整闭环：
 
-* `AuditLogAspect` 切面采集审计日志，通过 `AUDIT_LOG_NAME` Logger 输出 JSON 格式日志
-* Logback 配置了 `AsyncAppender` + `RollingFileAppender`，异步写入本地文件 `/var/log/app/audit/audit.log`
-* Docker Compose 中通过 `shared_audit_logs` 卷共享日志文件目录给 Vector Agent
-* Vector Agent 读取共享卷中的日志文件，解析 JSON 后直接写入 PG 数据库（配置 PG sink）
+* **Claim Check 卸载机制**：
+** **流式处理**：使用 Kryo 流式序列化 `before/after` 对象，消除大内存拷贝。
+** **异步压缩**：采用 **GZIP (BEST_SPEED)** 算法，由专用存储线程池异步压缩并上传至 MinIO，对业务主逻辑零干扰。
+** **详情指针**：审计详情被替换为 `{"_storage":"MINIO","_url":"..."}` 存储于数据库。
+* **元数据物理化 (Metadata Physicalization)**：
+** Vector Agent 监听本地日志，动态提取 `business_id`、`trace_id` 等高频检索字段。
+** 字段映射：Vector 将这些关键字段直接映射为 PostgreSQL 的 **B-Tree 索引列**，确保秒级精确匹配。
+* **懒加载详情还原**：
+** 提供详情接口，仅在查看时触发。
+** 后端自动识别指针，从 MinIO 下载并执行 **GZIP 解压 -> Kryo 反序列化**，实现数据的透明还原。
 
-数据流：**业务服务 → 本地文件 → Vector → PG**（4层）
+数据流：**业务服务(Claim Check) → 本地文件 → Vector → PG**
+附件流：**业务服务 → MinIO**
 
 ==== 序列图
 
@@ -157,41 +162,40 @@ autonumber
 hide footbox
 
 actor "用户" as User
-participant "业务服务\n(sg-audit-starter)" as Biz
-database "本地文件\n(audit.log)" as File
-participant "Vector\nAgent" as Vector
+participant "业务服务" as Biz
+participant "MinIO" as MinIO
+database "本地文件" as File
+participant "Vector Agent" as Vector
 database "PG数据库" as PG
 
-User -> Biz: 发起业务请求
+User -> Biz: 更新操作(10MB)
 activate Biz
 
-Biz -> Biz: AOP切面拦截\n生成审计日志
+Biz -> Biz: Kryo流式序列化
 
-note right of Biz: Logback 异步写入\n(AsyncAppender)
-
-Biz -> File: 写入审计日志(JSON)
+note right of Biz: 触发 Claim Check
+Biz -> MinIO: 异步压缩上传(GZIP)
+activate MinIO
+Biz -> File: 记录含MinIO指针的日志
 activate File
-File --> Biz: 写入完成(本地IO)
-deactivate File
 
-Biz --> User: 返回业务响应
+Biz --> User: 200 OK (毫秒级响应)
 deactivate Biz
 
-== Vector 采集与入库 ==
+== 异步入库与检索 ==
 
-loop 持续监听
-    Vector -> File: 读取新增日志行
-    activate File
-    File --> Vector: 返回日志内容
-    deactivate File
-    
-    Vector -> Vector: 解析JSON\n转换格式
-    
-    Vector -> PG: 批量INSERT
-    activate PG
-    PG --> Vector: 写入成功
-    deactivate PG
-end
+Vector -> File: 采集日志行
+Vector -> Vector: **提取 business_id 物理列**
+Vector -> PG: 批量写入物理列+JSONB
+activate PG
+
+User -> Biz: Search (按 business_id)
+Biz -> PG: 索引查询(10ms)
+PG --> User: 返回简要列表
+
+User -> Biz: 查看详情(ID)
+Biz -> MinIO: 下载并解压还原
+MinIO --> User: 展示原始10MB数据
 
 @enduml
 ----
@@ -200,14 +204,16 @@ end
 
 ==== 方案描述
 
-业务服务中的 `sg-audit-starter` 在采集到审计日志后，通过日志框架（Logback）将审计日志写入本地文件。
-使用独立的 Vector Agent 监听日志文件的变化，将日志内容解析后发送到 Kafka Topic。
-后端的 Consumer 服务消费 Kafka 消息，批量写入 PG 数据库。
+在方案二的基础上，引入 Kafka 作为中间缓冲层。业务服务依然执行 **Claim Check** 将大报文卸载至 MinIO，并写入包含指针的轻量化本地日志。Vector Agent 采集并解析日志后，将包含业务元数据的消息发送至 Kafka Topic，由后端 Consumer 批量写入 PG。
 
-与方案二的区别在于 Vector 不直接写 PG，而是将消息发送到 Kafka，由独立的 Consumer 服务消费后写入 PG。
-引入 Kafka 作为中间缓冲层，在极高并发场景下可以更好地削峰填谷。
+该方案适用于极高并发（如单机 TPS > 5000）且对入库实时性要求不高的超大规模场景。
 
-数据流：**业务服务 → 本地文件 → Vector → Kafka → Consumer → PG**（5层）
+* **优势叠加**：继承了方案二的 Claim Check 优势，Kafka 消息体积极小，吞吐性能极佳。
+* **削峰填谷**：Kafka 能够缓冲瞬时极高峰流量，保护数据库在压力波动时不被连接耗尽。
+* **链路解耦**：采集层（Vector）与持久化层通过消息中间件彻底解耦。
+
+数据流：**业务服务(Claim Check) → 本地文件 → Vector → Kafka → Consumer → PG**
+附件流：**业务服务 → MinIO**
 
 ==== 序列图
 
@@ -218,60 +224,33 @@ autonumber
 hide footbox
 
 actor "用户" as User
-participant "业务服务\n(sg-audit-starter)" as Biz
-database "本地文件\n(audit.log)" as File
-participant "Vector\nAgent" as Vector
+participant "业务服务" as Biz
+participant "MinIO" as MinIO
+database "本地文件" as File
+participant "Vector Agent" as Vector
 participant "Kafka" as Kafka
-participant "Consumer服务\n(platform)" as Consumer
+participant "Consumer服务" as Consumer
 database "PG数据库" as PG
 
-User -> Biz: 发起业务请求
+User -> Biz: 更新操作(10MB)
 activate Biz
-
-Biz -> Biz: AOP切面拦截\n生成审计日志
-
-note right of Biz: Logback 异步写入\n(AsyncAppender)
-
-Biz -> File: 写入审计日志(JSON)
-activate File
-File --> Biz: 写入完成(本地IO)
-deactivate File
-
-Biz --> User: 返回业务响应
+Biz -> MinIO: 异步压缩上传(Claim Check)
+Biz -> File: 记录轻量日志(含指针)
+Biz --> User: 返回响应
 deactivate Biz
 
-== Vector 采集 ==
+== 异步分发 ==
 
-loop 持续监听
-    Vector -> File: 读取新增日志行
-    activate File
-    File --> Vector: 返回日志内容
-    deactivate File
-    
-    Vector -> Vector: 解析JSON\n转换格式
-    
-    Vector -> Kafka: 发送到Topic
-    activate Kafka
-    Kafka --> Vector: ACK
-    deactivate Kafka
-end
-
-== 异步消费 ==
+Vector -> File: 监听读取
+Vector -> Vector: 提取物理列元数据
+Vector -> Kafka: 发送轻量消息
+activate Kafka
+Kafka --> Vector: ACK
+deactivate Kafka
 
 loop 批量消费
-    Consumer -> Kafka: 拉取消息(batch)
-    activate Kafka
-    Kafka --> Consumer: 返回审计日志消息
-    deactivate Kafka
-    
-    Consumer -> Consumer: 解析\聚合消息
-    
-    Consumer -> PG: 批量INSERT
-    activate PG
-    PG --> Consumer: 写入成功
-    deactivate PG
-    
-    Consumer -> Kafka: 提交offset
+    Consumer -> Kafka: 拉取消息
+    Consumer -> PG: 批量写入物理列与指针
 end
 
 @enduml
