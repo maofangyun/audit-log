@@ -3,7 +3,6 @@ package com.example.demo.controller;
 import com.example.demo.log.AuditContextHolder;
 import com.example.demo.log.AuditLog;
 import com.example.demo.service.ClaimCheckService;
-import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -20,7 +19,8 @@ import java.util.Map;
 /**
  * 审计日志功能测试控制器
  *
- * <p>提供用户更新、审计日志查询、审计详情懒加载三个端点，
+ * <p>
+ * 提供用户更新、审计日志查询、审计详情懒加载三个端点，
  * 用于演示和验证 Claim Check 模式的完整链路。
  */
 @RestController
@@ -32,8 +32,8 @@ public class AuditTestController {
     private final ObjectMapper objectMapper;
 
     public AuditTestController(JdbcTemplate jdbcTemplate,
-                               ClaimCheckService claimCheckService,
-                               ObjectMapper objectMapper) {
+            ClaimCheckService claimCheckService,
+            ObjectMapper objectMapper) {
         this.jdbcTemplate = jdbcTemplate;
         this.claimCheckService = claimCheckService;
         this.objectMapper = objectMapper;
@@ -44,12 +44,7 @@ public class AuditTestController {
     /**
      * 模拟用户更新操作，触发 @AuditLog 切面记录审计日志。
      */
-    @AuditLog(
-        action = "UPDATE_USER",
-        resourceType = "USER",
-        resourceIdSpEL = "#req.id",
-        newObjectSpEL = "#result"
-    )
+    @AuditLog(action = "UPDATE_USER", resourceType = "USER", resourceIdSpEL = "#req.id", businessKeySpEL = "{'userId': #req.id}", newObjectSpEL = "#result")
     @PostMapping("/user/update")
     public UserDto updateUser(@RequestBody UserDto req) {
         // 1. 从"数据库"中查询修改前的旧数据并冻结快照
@@ -60,39 +55,62 @@ public class AuditTestController {
         return req;
     }
 
+    // ── SpEL Bean 方法调用测试接口 ──────────────────────────────────
+
+    /**
+     * 测试在 SpEL 中调用 Spring 容器里注册的 Bean 的方法。
+     */
+    @AuditLog(action = "TEST_SPEL_BEAN", resourceType = "TEST", resourceIdSpEL = "#id.toString()", oldObjectSpEL = "@testAuditHelper.getOldValue(#id, #type)", newObjectSpEL = "@testAuditHelper.getNewValue(#result)")
+    @PostMapping("/spel/bean")
+    public String testSpelBean(@RequestParam Long id, @RequestParam String type) {
+        return "RESULT_" + id;
+    }
+
     // ── 审计日志查询接口 ───────────────────────────────────────────
 
     /**
      * 基于业务主键快速查询审计日志列表（毫秒级响应）。
      *
      * @param bizId 业务主键
-     * @return 审计日志摘要列表（不含 details）
+     * @return 审计日志摘要列表
      */
     @GetMapping("/audit/search")
     public List<Map<String, Object>> search(@RequestParam String bizId) {
-        String sql = "SELECT id, timestamp, action, resource_type, resource_id, status, is_large_payload "
-                   + "FROM audit_logs WHERE business_id = ? ORDER BY timestamp DESC";
-        return jdbcTemplate.queryForList(sql, bizId);
+        // 构建用于 JSONB 包含查询的参数，例如：{"userId": "1"}
+        String jsonbParam = String.format("{\"userId\": \"%s\"}", bizId);
+        String sql = "SELECT id, timestamp, action, resource_type, resource_id, status "
+                + "FROM audit_logs WHERE business_key @> ?::jsonb ORDER BY timestamp DESC";
+        return jdbcTemplate.queryForList(sql, jsonbParam);
     }
 
     /**
-     * 懒加载审计详情：若为大对象则实时从 MinIO 拉取，否则直接返回数据库存储的 JSON。
+     * 查询审计详情：从 audit_log_items 子表获取 before / after 明细。
+     * 若 payload 为 MinIO 指针，则实时从对象存储还原原始对象。
      *
      * @param id 审计日志主键
-     * @return 审计详情（原始对象或 MinIO 下载内容）
+     * @return before / after 明细列表
      */
     @GetMapping("/audit/detail/{id}")
     public Object getDetail(@PathVariable Long id) {
-        String sql = "SELECT details, is_large_payload FROM audit_logs WHERE id = ?";
-        Map<String, Object> log = jdbcTemplate.queryForMap(sql, id);
+        String sql = "SELECT item_index, direction, item_type, payload::text AS payload "
+                + "FROM audit_log_items WHERE audit_log_id = ? ORDER BY direction, item_index";
+        List<Map<String, Object>> items = jdbcTemplate.queryForList(sql, id);
 
-        boolean isLarge = Boolean.TRUE.equals(log.get("is_large_payload"));
-        Object detailsObj = log.get("details");
-
-        if (isLarge) {
-            return fetchLargePayload(detailsObj);
-        }
-        return detailsObj;
+        // 对每一个 item 判断是否为 MinIO 指针，若是则还原
+        items.forEach(item -> {
+            String payloadStr = (String) item.get("payload");
+            if (payloadStr != null && payloadStr.contains("\"_storage\"")) {
+                try {
+                    com.fasterxml.jackson.databind.JsonNode node =
+                            objectMapper.readTree(payloadStr);
+                    String minioUrl = node.get("_url").asText();
+                    item.put("payload", claimCheckService.downloadPayload(minioUrl));
+                } catch (Exception e) {
+                    item.put("payload", "Error restoring payload: " + e.getMessage());
+                }
+            }
+        });
+        return items;
     }
 
     // ── 私有辅助方法 ───────────────────────────────────────────────
@@ -104,33 +122,6 @@ public class AuditTestController {
         return new UserDto(id, "Tom", 17);
     }
 
-    /**
-     * 解析 Claim Check 指针并从 MinIO 下载大对象.
-     */
-    private Object fetchLargePayload(Object detailsObj) {
-        try {
-            String minioUrl;
-            if (detailsObj instanceof Map) {
-                // 情况 A：JDBC 驱动已自动将 JSON 转为 Map
-                minioUrl = (String) ((Map<?, ?>) detailsObj).get("_url");
-            } else {
-                // 情况 B：返回的是 String 或 PGobject，需 Jackson 解析
-                JsonNode node = objectMapper.readTree(detailsObj.toString());
-                // 兼容处理：若为双重转义字符串则再解析一次
-                if (node.isTextual()) {
-                    node = objectMapper.readTree(node.asText());
-                }
-                minioUrl = node.get("_url").asText();
-            }
-
-            if (minioUrl == null) {
-                return "Error: MinIO URL not found in details";
-            }
-            return claimCheckService.downloadPayload(minioUrl);
-        } catch (Exception e) {
-            return "Error restoring payload: " + e.getMessage();
-        }
-    }
 
     // ── 内部 DTO ──────────────────────────────────────────────────
 

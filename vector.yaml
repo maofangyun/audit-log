@@ -1,44 +1,54 @@
 ## =============================================================
-## Vector 配置 — Claim Check 模式（Java → 本地日志 → Vector → PostgreSQL）
+## Vector 配置 — 双管道模式
+## 管道 A：audit_logs（主表）  → /var/log/app/audit/*.log
+## 管道 B：audit_log_items（子表）→ /var/log/app/audit/items/*.log
 ## =============================================================
 
 # ──────────────────────────────────────────────────────────────
-# Source：监听 Java 应用写入的 JSON 日志文件
+# Sources
 # ──────────────────────────────────────────────────────────────
 sources:
-  audit_logs:
+  # 管道 A：主表日志
+  audit_logs_source:
     type: file
     include: ["/var/log/app/audit/*.log"]
+    exclude: ["/var/log/app/audit/items/*.log"]   # 排除子表日志，防止交叉读取
     read_from: beginning
     data_dir: /var/lib/vector
     # 提升至 30MB，确保 11MB 原始数据 + 转义字符 + 外层 JSON 都能容纳
     max_line_bytes: 31457280
 
+  # 管道 B：子表日志
+  audit_items_source:
+    type: file
+    include: ["/var/log/app/audit/items/*.log"]
+    read_from: beginning
+    data_dir: /var/lib/vector
+    max_line_bytes: 31457280
+
 # ──────────────────────────────────────────────────────────────
-# Transform：解析 JSON，识别大对象标志，整理字段映射
+# Transforms
 # ──────────────────────────────────────────────────────────────
 transforms:
-  parse:
+  # 管道 A Transform：解析主表字段
+  parse_logs:
     type: remap
-    inputs: ["audit_logs"]
-    # 即使解析出错也不要让整个 pipeline 停止
-    drop_on_error: true 
+    inputs: ["audit_logs_source"]
+    drop_on_error: true
     source: |
-      # 尝试解析外层
       outer, err = parse_json(.message)
       if err != null {
         log("Outer JSON parse error: " + err, level: "warn")
         abort
       }
 
-      # 尝试解析内层业务日志
       inner, err = parse_json(outer.message)
       if err != null {
         log("Inner JSON parse error (possibly truncated): " + err, level: "warn")
         abort
       }
 
-      # ── 构造落库事件 ────────────────────────────────────────────
+      # ── 构造落库事件 ─────────────────────────────────────────
       new_event = {}
       new_event.id             = inner.id
       new_event.timestamp      = outer."@timestamp"
@@ -47,53 +57,85 @@ transforms:
       new_event.action         = inner.action
       new_event.resource_type  = inner.resourceType
       new_event.resource_id    = inner.resourceId
-      new_event.business_id    = inner.businessId
-      new_event.status         = inner.status
 
-      # ── Claim Check 识别：is_large_payload 字段 ─────────────────
-      # 兼容多种 key 名称
-      if exists(inner.largePayload) {
-        new_event.is_large_payload = inner.largePayload
-      } else if exists(inner.isLargePayload) {
-        new_event.is_large_payload = inner.isLargePayload
+      if exists(inner.businessKey) && inner.businessKey != null {
+        new_event.business_key = inner.businessKey
       } else {
-        new_event.is_large_payload = false
+        new_event.business_key = {}
+      }
+      new_event.status = inner.status
+
+      . = new_event
+
+  # 管道 B Transform：解析子表字段
+  parse_items:
+    type: remap
+    inputs: ["audit_items_source"]
+    drop_on_error: true
+    source: |
+      outer, err = parse_json(.message)
+      if err != null {
+        log("Items outer JSON parse error: " + err, level: "warn")
+        abort
       }
 
-      # ── details 字段处理 ─────────────────────────────────────────
-      # 直接保留对象结构，Vector 的 postgres sink 会自动将其转为 JSONB 写入
-      if exists(inner.details) && inner.details != null {
-        new_event.details = inner.details
-      } else {
-        new_event.details = {}
+      inner, err = parse_json(outer.message)
+      if err != null {
+        log("Items inner JSON parse error: " + err, level: "warn")
+        abort
       }
 
-      # ── 替换当前事件 ────────────────────────────────────────────
+      # ── 构造子表落库事件 ──────────────────────────────────────
+      new_event = {}
+      new_event.audit_log_id = inner.auditLogId
+      new_event.item_index   = inner.itemIndex
+      new_event.direction    = inner.direction
+      new_event.item_type    = inner.itemType
+
+      # payload 可能为对象（小对象）或 Map（MinIO 指针），统一作为 JSONB 写入
+      if exists(inner.payload) && inner.payload != null {
+        new_event.payload = inner.payload
+      } else {
+        new_event.payload = {}
+      }
+
       . = new_event
 
 # ──────────────────────────────────────────────────────────────
 # Sinks
 # ──────────────────────────────────────────────────────────────
 sinks:
-  # 调试用：docker-compose logs vector-agent 可见干净 JSON
+  # 调试用控制台（主表）
   console_out:
     type: console
-    inputs: ["parse"]
+    inputs: ["parse_logs"]
     encoding:
       codec: json
 
-  # 核心落库：PostgreSQL audit_logs 表
-  pg_sink:
+  # 管道 A 落库：audit_logs 主表
+  pg_sink_logs:
     type: postgres
-    inputs: ["parse"]
+    inputs: ["parse_logs"]
     endpoint: "postgresql://audit_user:audit_pass@postgres:5432/audit_db"
     table: "audit_logs"
-    # 攒批写入：减少 PG 连接次数，提升吞吐
     batch:
       max_events: 50
       timeout_secs: 1
-    # ── 磁盘容灾缓冲（防止 PG 写入抖动导致 Vector 阻塞/OOM）──────
     buffer:
       type: disk
       max_size: 5368709120  # 5GB 磁盘缓冲上限
-      when_full: block       # 满后背压阻塞上游，不丢数据
+      when_full: block
+
+  # 管道 B 落库：audit_log_items 子表
+  pg_sink_items:
+    type: postgres
+    inputs: ["parse_items"]
+    endpoint: "postgresql://audit_user:audit_pass@postgres:5432/audit_db"
+    table: "audit_log_items"
+    batch:
+      max_events: 200       # 子表写入量大，批次加大
+      timeout_secs: 1
+    buffer:
+      type: disk
+      max_size: 2684354560  # 2.5GB 磁盘缓冲
+      when_full: block

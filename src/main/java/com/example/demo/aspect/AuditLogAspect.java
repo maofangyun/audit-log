@@ -3,7 +3,7 @@ package com.example.demo.aspect;
 import com.example.demo.log.AuditContextHolder;
 import com.example.demo.log.AuditLog;
 import com.example.demo.log.AuditMessage;
-import com.example.demo.service.ClaimCheckService;
+import com.example.demo.service.AuditItemService;
 import com.example.demo.util.SnowflakeIdWorker;
 import com.example.demo.util.SpElUtils;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -15,29 +15,31 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
 import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.core.StandardReflectionParameterNameDiscoverer;
+import org.springframework.context.ApplicationContext;
+import org.springframework.context.expression.BeanFactoryResolver;
+import org.springframework.core.DefaultParameterNameDiscoverer;
+import org.springframework.core.ParameterNameDiscoverer;
+import org.springframework.core.annotation.MergedAnnotation;
+import org.springframework.core.annotation.MergedAnnotations;
 import org.springframework.expression.spel.support.StandardEvaluationContext;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
+import org.springframework.aop.support.AopUtils;
 
 import java.lang.reflect.Method;
-import java.util.HashMap;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
+import org.springframework.context.expression.AnnotatedElementKey;
 
 /**
  * 审计日志切面 —— Claim Check 模式集成版
  *
- * <p>处理流程：
- * <ol>
- *   <li>AOP 拦截 {@link AuditLog} 注解方法</li>
- *   <li>同步执行目标方法</li>
- *   <li>提交异步任务至 auditAsyncPool</li>
- *   <li>异步任务内：Claim Check 决策 → 构造 {@link AuditMessage} → 落盘</li>
- * </ol>
- *
- * <p>SpEL 解析委托 {@link SpElUtils}，ID 生成委托 {@link SnowflakeIdWorker}。
+ * <p>
+ * 支持注解合并：优先使用子类/方法上的注解属性，若为默认值则尝试从父类/抽象类获取。
  */
 @Aspect
 @Component
@@ -45,55 +47,65 @@ public class AuditLogAspect {
 
     private static final Logger AUDIT_LOGGER = LoggerFactory.getLogger("AUDIT_LOG_NAME");
 
-    private final StandardReflectionParameterNameDiscoverer paramNameDiscoverer =
-            new StandardReflectionParameterNameDiscoverer();
+    private final ParameterNameDiscoverer paramNameDiscoverer = new DefaultParameterNameDiscoverer();
 
     private final ObjectMapper objectMapper;
-    private final ClaimCheckService claimCheckService;
+    private final AuditItemService auditItemService;
     private final Executor auditAsyncPool;
     private final SnowflakeIdWorker snowflakeIdWorker;
+    private final ApplicationContext applicationContext;
 
-    public AuditLogAspect(ClaimCheckService claimCheckService,
-                          @Qualifier("auditAsyncPool") Executor auditAsyncPool,
-                          ObjectMapper objectMapper,
-                          SnowflakeIdWorker snowflakeIdWorker) {
-        this.claimCheckService = claimCheckService;
+    public AuditLogAspect(AuditItemService auditItemService,
+            @Qualifier("auditAsyncPool") Executor auditAsyncPool,
+            ObjectMapper objectMapper,
+            SnowflakeIdWorker snowflakeIdWorker,
+            ApplicationContext applicationContext) {
+        this.auditItemService = auditItemService;
         this.auditAsyncPool = auditAsyncPool;
         this.objectMapper = objectMapper;
         this.snowflakeIdWorker = snowflakeIdWorker;
+        this.applicationContext = applicationContext;
     }
 
-    @Around("@annotation(auditLog)")
-    public Object around(ProceedingJoinPoint joinPoint, AuditLog auditLog) throws Throwable {
-        // 1. 生成 traceId（若 MDC 已有则复用）
+    @Around("@annotation(com.example.demo.log.AuditLog) || @within(com.example.demo.log.AuditLog)")
+    public Object around(ProceedingJoinPoint joinPoint) throws Throwable {
+        // 1. 获取合并后的注解信息
+        MethodSignature signature = (MethodSignature) joinPoint.getSignature();
+        Method method = AopUtils.getMostSpecificMethod(signature.getMethod(), joinPoint.getTarget().getClass());
+        AuditLogData auditLog = resolveAuditLog(method, joinPoint.getTarget().getClass());
+
+        if (auditLog == null) {
+            return joinPoint.proceed();
+        }
+
+        // 2. 生成 traceId（若 MDC 已有则复用）
         String traceId = MDC.get("traceId");
         if (!StringUtils.hasText(traceId)) {
             traceId = UUID.randomUUID().toString().replace("-", "");
         }
         String userId = MDC.get("userId");
 
-        // 2. 构建 SpEL 上下文
-        MethodSignature signature = (MethodSignature) joinPoint.getSignature();
-        Method method = signature.getMethod();
+        // 3. 构建 SpEL 上下文
         Object[] args = joinPoint.getArgs();
         String[] paramNames = paramNameDiscoverer.getParameterNames(method);
         StandardEvaluationContext spelContext = SpElUtils.buildContext(paramNames, args);
+        spelContext.setBeanResolver(new BeanFactoryResolver(applicationContext));
 
-        // 3. 解析注解属性
-        String resourceId = SpElUtils.evalString(auditLog.resourceIdSpEL(), spelContext, "PARSE_ERROR");
+        // 4. 解析注解属性
+        String resourceId = SpElUtils.evalString(auditLog.resourceIdSpEL, spelContext, "PARSE_ERROR");
 
-        // userId：优先 MDC，其次注解 SpEL
+        Object businessKey = null;
+        if (StringUtils.hasText(auditLog.businessKeySpEL)) {
+            businessKey = SpElUtils.eval(auditLog.businessKeySpEL, spelContext);
+        }
+
         if (!StringUtils.hasText(userId)) {
-            userId = SpElUtils.evalString(auditLog.userIdSpEL(), spelContext, null);
+            userId = SpElUtils.evalString(auditLog.userIdSpEL, spelContext, null);
         }
 
-        // oldObject：优先注解 SpEL，其次 AuditContextHolder
-        Object oldObject = SpElUtils.eval(auditLog.oldObjectSpEL(), spelContext);
-        if (oldObject == null) {
-            oldObject = AuditContextHolder.getOldObject();
-        }
+        Object oldObjectSpELResult = SpElUtils.eval(auditLog.oldObjectSpEL, spelContext);
 
-        // 4. 执行目标方法
+        // 5. 执行目标方法
         String status = "SUCCESS";
         String errorMsg = null;
         Object result = null;
@@ -105,71 +117,112 @@ public class AuditLogAspect {
             errorMsg = t.getMessage();
             throw t;
         } finally {
-            // 5. 异步提交审计任务
-            final String finalTraceId    = traceId;
-            final String finalUserId     = userId;
-            final String finalResourceId = resourceId;
-            final String finalStatus     = status;
-            final String finalErrorMsg   = errorMsg;
-            final Object finalOldObject  = oldObject;
-            final Object finalResult     = result;
+            // 6. 在方法执行后读取 AuditContextHolder（Controller 在方法体内调用 setOldObject）
+            Object oldObject = oldObjectSpELResult;
+            if (oldObject == null) {
+                oldObject = AuditContextHolder.getOldObject();
+            }
 
-            auditAsyncPool.execute(() ->
-                processAuditAsync(
-                    auditLog, spelContext,
-                    finalTraceId, finalUserId, finalResourceId,
+            // 7. 异步提交审计任务
+            final String finalTraceId = traceId;
+            final String finalUserId = userId;
+            final String finalResourceId = resourceId;
+            final Object finalBusinessKey = businessKey;
+            final String finalStatus = status;
+            final String finalErrorMsg = errorMsg;
+            final Object finalOldObject = oldObject;
+            final Object finalResult = result;
+            final AuditLogData finalAuditLog = auditLog;
+
+            auditAsyncPool.execute(() -> processAuditAsync(
+                    finalAuditLog, spelContext,
+                    finalTraceId, finalUserId, finalResourceId, finalBusinessKey,
                     finalStatus, finalErrorMsg,
-                    finalOldObject, finalResult
-                )
-            );
+                    finalOldObject, finalResult));
             AuditContextHolder.clear();
         }
     }
 
-    /**
-     * 异步审计处理核心：Claim Check 决策 + 构造消息 + 落盘
-     */
-    private void processAuditAsync(AuditLog auditLog,
-                                   StandardEvaluationContext spelContext,
-                                   String traceId, String userId, String resourceId,
-                                   String status, String errorMsg,
-                                   Object oldObject, Object methodResult) {
-        try {
-            // 解析 newObject（方法执行后快照，可通过 #result 引用返回值）
-            SpElUtils.setVariable(spelContext, "result", methodResult);
-            Object newObject = SpElUtils.eval(auditLog.newObjectSpEL(), spelContext);
+    // 缓存解析过的注解配置，提升高并发性能 (Method + TargetClass 作为联合 Key)
+    private final Map<AnnotatedElementKey, AuditLogData> auditLogCache = new ConcurrentHashMap<>();
 
-            // Claim Check 决策
-            Object detailsPayload;
-            boolean isLargePayload;
-            Map<String, Object> pointer = claimCheckService.processDetailsPayload(traceId, oldObject, newObject);
-            if (pointer != null) {
-                isLargePayload = true;
-                detailsPayload = pointer;
-            } else {
-                isLargePayload = false;
-                Map<String, Object> inline = new HashMap<>();
-                if (oldObject != null) inline.put("before", oldObject);
-                if (newObject != null) inline.put("after",  newObject);
-                if (StringUtils.hasText(errorMsg)) inline.put("error", errorMsg);
-                detailsPayload = inline.isEmpty() ? null : inline;
+    private AuditLogData resolveAuditLog(Method method, Class<?> targetClass) {
+        AnnotatedElementKey cacheKey = new AnnotatedElementKey(method, targetClass);
+        return auditLogCache.computeIfAbsent(cacheKey, key -> {
+            List<MergedAnnotation<AuditLog>> annotations = new ArrayList<>();
+            // 顺序：方法继承链 -> 类继承链 (由近及远)
+            MergedAnnotations.from(method, MergedAnnotations.SearchStrategy.TYPE_HIERARCHY)
+                    .stream(AuditLog.class).forEach(annotations::add);
+            MergedAnnotations.from(targetClass, MergedAnnotations.SearchStrategy.TYPE_HIERARCHY)
+                    .stream(AuditLog.class).forEach(annotations::add);
+
+            if (annotations.isEmpty()) {
+                return null;
             }
 
-            // 构造 AuditMessage 并落盘
+            AuditLogData data = new AuditLogData();
+            for (MergedAnnotation<AuditLog> ann : annotations) {
+                // 利用 Spring 的 StringUtils.hasText()，当属性不存在或为空字符串时，自动采用下一个更外层注解的属性值
+                if (!StringUtils.hasText(data.action))
+                    data.action = ann.getString("action");
+                if (!StringUtils.hasText(data.resourceType))
+                    data.resourceType = ann.getString("resourceType");
+                if (!StringUtils.hasText(data.resourceIdSpEL))
+                    data.resourceIdSpEL = ann.getString("resourceIdSpEL");
+                if (!StringUtils.hasText(data.businessKeySpEL))
+                    data.businessKeySpEL = ann.getString("businessKeySpEL");
+                if (!StringUtils.hasText(data.userIdSpEL))
+                    data.userIdSpEL = ann.getString("userIdSpEL");
+                if (!StringUtils.hasText(data.oldObjectSpEL))
+                    data.oldObjectSpEL = ann.getString("oldObjectSpEL");
+                if (!StringUtils.hasText(data.newObjectSpEL))
+                    data.newObjectSpEL = ann.getString("newObjectSpEL");
+            }
+            return data;
+        });
+    }
+
+    private static class AuditLogData {
+        String action;
+        String resourceType;
+        String resourceIdSpEL = "";
+        String businessKeySpEL = "";
+        String userIdSpEL = "";
+        String oldObjectSpEL = "";
+        String newObjectSpEL = "";
+    }
+
+    private void processAuditAsync(AuditLogData auditLog,
+            StandardEvaluationContext spelContext,
+            String traceId, String userId, String resourceId, Object businessKey,
+            String status, String errorMsg,
+            Object oldObject, Object methodResult) {
+        try {
+            SpElUtils.setVariable(spelContext, "result", methodResult);
+            Object newObject = SpElUtils.eval(auditLog.newObjectSpEL, spelContext);
+
+            // 1. 生成主记录 ID（子表通过此 ID 关联，无外键约束，顺序无关）
+            long auditLogId = snowflakeIdWorker.nextId();
+
+            // 2. 构建主记录（纯元数据，无 details / isLargePayload）
             AuditMessage msg = AuditMessage.builder()
-                    .id(snowflakeIdWorker.nextId())
+                    .id(auditLogId)
                     .traceId(traceId)
                     .userId(userId)
-                    .action(auditLog.action())
-                    .resourceType(auditLog.resourceType())
+                    .action(auditLog.action)
+                    .resourceType(auditLog.resourceType)
                     .resourceId(resourceId)
-                    .businessId(resourceId)
+                    .businessKey(businessKey != null ? businessKey : resourceId)
                     .status(status)
-                    .isLargePayload(isLargePayload)
-                    .details(detailsPayload)
                     .build();
 
+            // 3. 落盘主记录（AUDIT_LOGGER → 日志文件 → Vector → audit_logs）
             AUDIT_LOGGER.info(objectMapper.writeValueAsString(msg));
+
+            // 4. 写子项日志（AUDIT_ITEMS_LOGGER → 日志文件 → Vector → audit_log_items）
+            //    无外键约束，before/after 均为 null 时静默跳过
+            auditItemService.saveItems(auditLogId, oldObject, "before", traceId);
+            auditItemService.saveItems(auditLogId, newObject, "after",  traceId);
 
         } catch (Exception e) {
             AUDIT_LOGGER.error("[AuditLogAspect] 审计任务处理异常: {}", e.getMessage(), e);

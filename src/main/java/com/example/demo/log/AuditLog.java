@@ -22,7 +22,7 @@ import java.lang.annotation.Target;
  * public UserDto updateUser(UserDto req) { ... }
  * }</pre>
  */
-@Target(ElementType.METHOD)
+@Target({ElementType.METHOD, ElementType.TYPE})
 @Retention(RetentionPolicy.RUNTIME)
 @Documented
 public @interface AuditLog {
@@ -35,6 +35,9 @@ public @interface AuditLog {
 
     /** 资源 ID 的 SpEL 表达式，如 {@code "#req.id"} */
     String resourceIdSpEL() default "";
+
+    /** 业务主键的 SpEL 表达式，支持返回对象或Map以转换为 JSONB（如 {@code "{'orderId': #req.id}"}） */
+    String businessKeySpEL() default "";
 
     /** 操作人 ID 的 SpEL 表达式（优先级低于 MDC 中的 userId）*/
     String userIdSpEL() default "";

@@ -41,25 +41,11 @@ public class AuditMessage {
     /** 资源 ID */
     private String resourceId;
 
-    /** 业务主键（用于极速索引，通常与 resourceId 相同） */
-    private String businessId;
+    /** 业务主键（作为 JSONB 存储，用于极速索引） */
+    private Object businessKey;
 
     /** 操作结果：SUCCESS / FAIL */
     private String status;
 
-    /**
-     * 是否为大对象（已卸载至 MinIO）。
-     * {@code true} 时 {@code details} 为 Claim Check 指针，
-     * {@code false} 时 {@code details} 为完整 before/after 结构。
-     */
-    private boolean isLargePayload;
-
-    /**
-     * 审计详情：
-     * <ul>
-     *   <li>小对象（&lt; 100KB）：{@code {"before": {...}, "after": {...}}}</li>
-     *   <li>大对象（&gt;= 100KB）：{@code {"_storage": "MINIO", "_url": "minio://..."}}</li>
-     * </ul>
-     */
-    private Object details;
+    // ℹ️ before/after 数据均存储于 audit_log_items 子表，此处不再冗余存储
 }

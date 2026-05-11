@@ -8,12 +8,15 @@
     </root>
 
     <springProperty scope="context" name="APP_NAME" source="spring.application.name" defaultValue="audit-log"/>
+    <!-- 允许通过环境变量指定实例 ID (如 Docker 容器 ID)。若未指定，则为空 -->
+    <property name="INSTANCE_ID" value="${INSTANCE_ID:-}"/>
 
     <!-- Audit Rolling File Appender -->
     <appender name="AUDIT_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
-        <file>/var/log/app/audit/audit.log</file>
+        <!-- 拼接后缀。若 INSTANCE_ID 为空，文件名为 audit-log.log；若需要隔离，请配置环境变量如 INSTANCE_ID=-pod1 -->
+        <file>/var/log/app/audit/${APP_NAME}${INSTANCE_ID}.log</file>
         <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
-            <fileNamePattern>/var/log/app/audit/audit-%d{yyyy-MM-dd}.%i.log</fileNamePattern>
+            <fileNamePattern>/var/log/app/audit/${APP_NAME}${INSTANCE_ID}-%d{yyyy-MM-dd}.%i.log</fileNamePattern>
             <maxFileSize>200MB</maxFileSize>
             <maxHistory>7</maxHistory>
         </rollingPolicy>
@@ -35,8 +38,39 @@
         <discardingThreshold>0</discardingThreshold>
     </appender>
 
-    <!-- Independent Logger -->
+    <!-- Independent Logger for audit_logs (main table) -->
     <logger name="AUDIT_LOG_NAME" level="INFO" additivity="false">
         <appender-ref ref="ASYNC_AUDIT" />
     </logger>
+
+    <!-- ── Audit Items: 子项日志（写 audit_log_items 表） ─────────────── -->
+    <appender name="AUDIT_ITEMS_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>/var/log/app/audit/items/${APP_NAME}${INSTANCE_ID}.log</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>/var/log/app/audit/items/${APP_NAME}${INSTANCE_ID}-%d{yyyy-MM-dd}.%i.log</fileNamePattern>
+            <maxFileSize>200MB</maxFileSize>
+            <maxHistory>7</maxHistory>
+        </rollingPolicy>
+        <encoder class="net.logstash.logback.encoder.LoggingEventCompositeJsonEncoder">
+            <providers>
+                <timestamp>
+                    <timeZone>UTC</timeZone>
+                </timestamp>
+                <mdc />
+                <message />
+            </providers>
+        </encoder>
+    </appender>
+
+    <appender name="ASYNC_AUDIT_ITEMS" class="ch.qos.logback.classic.AsyncAppender">
+        <appender-ref ref="AUDIT_ITEMS_FILE" />
+        <queueSize>4096</queueSize>
+        <discardingThreshold>0</discardingThreshold>
+    </appender>
+
+    <!-- Independent Logger for audit_log_items (sub table) -->
+    <logger name="AUDIT_ITEMS_LOG_NAME" level="INFO" additivity="false">
+        <appender-ref ref="ASYNC_AUDIT_ITEMS" />
+    </logger>
+
 </configuration>

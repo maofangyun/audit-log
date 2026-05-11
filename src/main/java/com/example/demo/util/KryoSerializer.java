@@ -13,15 +13,19 @@ import java.io.ByteArrayOutputStream;
 /**
  * Kryo 序列化工具类
  *
- * <p>封装 Kryo 序列化、反序列化及字节数组合并/拆分操作。
+ * <p>
+ * 封装 Kryo 序列化、反序列化及字节数组合并/拆分操作。
  * 使用 {@link ThreadLocal} 管理 Kryo 实例，保证线程安全且避免频繁创建开销。
  *
- * <p>字节合并格式（用于将 before/after 打包为单文件）：
+ * <p>
+ * 字节合并格式（用于将 before/after 打包为单文件）：
+ * 
  * <pre>
  * | 4字节（before 长度，大端序） | before 数据 | after 数据 |
  * </pre>
  *
- * <p>工具类，禁止实例化。
+ * <p>
+ * 工具类，禁止实例化。
  */
 public final class KryoSerializer {
 
@@ -47,38 +51,31 @@ public final class KryoSerializer {
      * 将对象直接序列化到输出流中（高性能流式写入）
      */
     public static void serializeToStream(Object obj, java.io.OutputStream os) {
-        if (obj == null) return;
+        if (obj == null)
+            return;
         Kryo kryo = KRYO_THREAD_LOCAL.get();
-        Output output = new Output(os);
+        Output output = new Output(os, 65536); // 使用 64KB 缓冲区（默认仅 4096），大幅减少大对象序列化时的 flush 频率
         kryo.writeClassAndObject(output, obj);
         output.flush();
     }
 
     /**
-     * 合并序列化：将 before 和 after 直接流式写入，减少内存拷贝
+     * 将单个对象序列化为字节数组。
+     *
+     * <p>用途：
+     * <ul>
+     *   <li>判断单元素大小，决定是否触发 Claim Check</li>
+     *   <li>作为 MinIO 上传的原始字节（大对象路径）</li>
+     * </ul>
+     *
+     * @param obj 待序列化对象
+     * @return 字节数组；obj 为 null 时返回空数组
      */
-    public static byte[] serializeCombined(Object before, Object after) {
-        java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream(1024 * 1024); // 初始 1MB
-        
-        // 1. 预留 4 字节存 before 长度
-        bos.write(0); bos.write(0); bos.write(0); bos.write(0);
-        
-        // 2. 序列化 before
-        serializeToStream(before, bos);
-        int beforeLen = bos.size() - 4;
-        
-        // 3. 序列化 after
-        serializeToStream(after, bos);
-        
-        byte[] result = bos.toByteArray();
-        
-        // 4. 回填 before 长度（大端序）
-        result[0] = (byte) (beforeLen >> 24);
-        result[1] = (byte) (beforeLen >> 16);
-        result[2] = (byte) (beforeLen >> 8);
-        result[3] = (byte) beforeLen;
-        
-        return result;
+    public static byte[] serialize(Object obj) {
+        if (obj == null) return new byte[0];
+        java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream(64 * 1024);
+        serializeToStream(obj, bos);
+        return bos.toByteArray();
     }
 
     /**
@@ -92,32 +89,11 @@ public final class KryoSerializer {
             return null;
         }
         Kryo kryo = KRYO_THREAD_LOCAL.get();
-        try (Input input = new Input(new ByteArrayInputStream(data))) {
+        try (Input input = new Input(new ByteArrayInputStream(data), 65536)) {
             return kryo.readClassAndObject(input);
         } catch (Exception e) {
             log.warn("[KryoSerializer] 反序列化失败: {}", e.getMessage());
             return null;
         }
-    }
-
-    /**
-     * 将两个字节数组合并为一个（已被 serializeCombined 取代，保留 split 用于解压）
-     */
-    public static byte[][] split(byte[] merged) {
-        if (merged == null || merged.length < 4) {
-            throw new IllegalArgumentException("非法的合并字节数组：长度不足 4 字节");
-        }
-        int firstLen = ((merged[0] & 0xFF) << 24)
-                     | ((merged[1] & 0xFF) << 16)
-                     | ((merged[2] & 0xFF) << 8)
-                     |  (merged[3] & 0xFF);
-        if (firstLen < 0 || firstLen > merged.length - 4) {
-            throw new IllegalArgumentException("非法的合并字节数组：first 长度超出范围");
-        }
-        byte[] first  = new byte[firstLen];
-        byte[] second = new byte[merged.length - 4 - firstLen];
-        System.arraycopy(merged, 4,             first,  0, first.length);
-        System.arraycopy(merged, 4 + firstLen,  second, 0, second.length);
-        return new byte[][]{first, second};
     }
 }
